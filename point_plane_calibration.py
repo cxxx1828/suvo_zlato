@@ -1,17 +1,17 @@
 """
-Point-to-plane LiDAR-camera extrinzicna kalibracija -- CISTA verzija,
-bez izmisljenih ogranicenja i bez rucnih offset hakova.
+Point-to-plane LiDAR-camera extrinsic calibration -- CLEAN version,
+no invented constraints and no manual offset hacks.
 
-Kamera strana: solvePnP na chessboard uglovima daje normalu i tacku
-ravni table U KAMERA koordinatama.
-Lidar strana: PCA fit ravni nad ROI tackama daje SAMO inlier tacke
-ravni (bez uglova/redosleda/interpolacije mreze).
+Camera side: solvePnP on chessboard corners gives the plane normal and a
+point on the board plane IN CAMERA coordinates.
+LiDAR side: PCA plane fit over ROI points gives ONLY inlier points on the
+plane (no corners/order/grid interpolation).
 
-Cost funkcija: point-to-plane rastojanje, SVI frejmovi odjednom.
-Dva prolaza: prvi nadje grubu ocenu i odbaci outlier frejmove (RMS
-prevelik), drugi re-optimizuje samo nad dobrim frejmovima.
+Cost function: point-to-plane distance, ALL frames at once.
+Two passes: the first finds a rough estimate and rejects outlier frames
+(RMS too high), the second re-optimizes using only the good frames.
 
-Pokretanje:
+Run:
     python3 point_plane_calibration.py
 """
 import glob, os, re
@@ -72,7 +72,7 @@ BOARD_CENTER_OBJ = np.array([(COLS_INNER - 1) * SQUARE_SIZE_M / 2.0,
                               (ROWS_INNER - 1) * SQUARE_SIZE_M / 2.0, 0.0])
 
 def board_plane_in_camera(img_pts, obj_pts, K, dist):
-    """Normala, tacka ravni i centar table, U KAMERA koordinatama."""
+    """Plane normal, plane point, and board center, IN CAMERA coordinates."""
     ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
     if not ok:
         return None
@@ -83,19 +83,20 @@ def board_plane_in_camera(img_pts, obj_pts, K, dist):
     return normal_cam, point_cam, center_cam
 
 
-# Fizicke dimenzije table (9x6 unutrasnji grid + margine, ~10x7 kvadrata
-# od 29mm). Blago uvecano za toleranciju.
+# Physical board dimensions (9x6 inner grid + margins, ~10x7 squares
+# of 29mm). Slightly enlarged for tolerance.
 BOARD_WIDTH_M = 10 * 0.029 * 1.15
 BOARD_HEIGHT_M = 7 * 0.029 * 1.15
 
 
 def extract_lidar_plane_points(pcd_path):
-    """SAMO inlier tacke ravni table (lidar frejm) -- PCA fit + filter
-    preko ORIJENTISANOG PRAVOUGAONIKA (ne kruga) velicine table.
-    Pod/zid koji dodiruju ivicu table se sire u JEDNOM pravcu (uzan
-    'rep'), pa krug oko centra to lako propusti cak i sa malim
-    radijusom -- pravougaonik poravnat sa glavnim osama table je mnogo
-    strozi jer prati stvarni oblik i orijentaciju table u ravni."""
+    """ONLY inlier points of the board plane (lidar frame) -- PCA fit + filter
+    via an ORIENTED RECTANGLE (not a circle) matching the board size.
+    A floor/wall touching the board's edge extends in ONE direction (a
+    narrow 'tail'), so a circle around the center can easily let it through
+    even with a small radius -- a rectangle aligned with the board's
+    principal axes is much stricter because it follows the board's actual
+    shape and orientation in the plane."""
     points, intensity = load_pcd_ascii(pcd_path)
     mask = np.all(np.abs(points - ROI_CENTER) < ROI_HALF_SIZE, axis=1)
     roi_points = points[mask]
@@ -123,7 +124,7 @@ def extract_lidar_plane_points(pcd_path):
     if len(coplanar_pts) < 10:
         return None
 
-    # 2D projekcija koplanarnih tacaka u ravan (u,v bazis oko normale)
+    # 2D projection of coplanar points onto the plane (u,v basis around the normal)
     arbitrary = np.array([1.0, 0.0, 0.0]) if abs(normal[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     u_axis = np.cross(normal, arbitrary); u_axis /= np.linalg.norm(u_axis)
     v_axis = np.cross(normal, u_axis)
@@ -131,8 +132,9 @@ def extract_lidar_plane_points(pcd_path):
     rel = coplanar_pts - board_centroid
     uv = np.stack([rel @ u_axis, rel @ v_axis], axis=1).astype(np.float32)
 
-    # PCA u samoj uv ravni da se nadje glavna orijentacija table (jer
-    # rectangle nije nuzno poravnat sa u_axis/v_axis izborom iznad).
+    # PCA within the uv plane itself to find the board's principal
+    # orientation (since the rectangle isn't necessarily aligned with the
+    # u_axis/v_axis choice above).
     uv_cov = np.cov(uv.T)
     uv_evals, uv_evecs = np.linalg.eigh(uv_cov)
     major_axis = uv_evecs[:, np.argmax(uv_evals)]
@@ -142,8 +144,9 @@ def extract_lidar_plane_points(pcd_path):
     along_major = rel_uv @ major_axis
     along_minor = rel_uv @ minor_axis
 
-    # Pravougaonik je poluopseg u svakom pravcu -- veca dimenzija table
-    # ide uz major_axis (deteknovana najveca varijansa), manja uz minor.
+    # The rectangle uses a half-extent in each direction -- the board's
+    # larger dimension follows major_axis (detected as the largest
+    # variance), the smaller follows minor_axis.
     half_major = max(BOARD_WIDTH_M, BOARD_HEIGHT_M) / 2
     half_minor = min(BOARD_WIDTH_M, BOARD_HEIGHT_M) / 2
     on_board_2d = (np.abs(along_major) < half_major) & (np.abs(along_minor) < half_minor)
@@ -184,7 +187,7 @@ def collect_frames():
 
         lidar_result = extract_lidar_plane_points(pcd_path)
         if lidar_result is None:
-            print(f"  [!] {basename}: nedovoljno lidar plane tacaka, preskacem")
+            print(f"  [!] {basename}: not enough LiDAR plane points, skipping")
             continue
         lidar_pts, lidar_center = lidar_result
 
@@ -193,11 +196,11 @@ def collect_frames():
     return frames, K, dist
 
 
-CENTER_WEIGHT = 40.0  # balansira centar-constraint protiv mnostva plane tacaka
+CENTER_WEIGHT = 40.0  # balances the center constraint against the large number of plane points
 
 def residuals(params, frames):
-    """Point-to-plane + centar-table point-to-point (resava neodredjenost
-    translacije unutar ravni koju plane-only cost ne vidi)."""
+    """Point-to-plane + board-center point-to-point (resolves the translation
+    ambiguity within the plane that the plane-only cost cannot observe)."""
     rvec = params[:3].reshape(3, 1)
     tvec = params[3:6].reshape(3, 1)
     R, _ = cv2.Rodrigues(rvec)
@@ -246,14 +249,14 @@ def optimize(frames):
 
 
 def main():
-    print("Sakupljanje uparenih podataka...")
+    print("Collecting paired data...")
     frames, K, dist = collect_frames()
-    print(f"Validnih frejmova u pocetku: {len(frames)}")
+    print(f"Valid frames initially: {len(frames)}")
     if len(frames) < 4:
-        print("Nedovoljno frejmova za stabilnu kalibraciju.")
+        print("Not enough frames for stable calibration.")
         return
 
-    print("\n--- PROLAZ 1: Inicijalna optimizacija ---")
+    print("\n--- PASS 1: Initial optimization ---")
     result1 = optimize(frames)
     rms_list = per_frame_rms(result1.x, frames)
 
@@ -261,41 +264,41 @@ def main():
                     if rms * 1000 <= OUTLIER_RMS_THRESHOLD_MM]
     bad = [(name, rms) for name, rms in rms_list if rms * 1000 > OUTLIER_RMS_THRESHOLD_MM]
     if bad:
-        print(f"Izbaceno {len(bad)} outlier frejmova sa RMS > {OUTLIER_RMS_THRESHOLD_MM}mm:")
+        print(f"Rejected {len(bad)} outlier frames with RMS > {OUTLIER_RMS_THRESHOLD_MM}mm:")
         for name, rms in bad:
             print(f"  [X] {name}: RMS={rms*1000:.2f}mm")
 
     if len(good_frames) < 4:
-        print("Premalo dobrih frejmova posle filtriranja, koristim sve iz prolaza 1.")
+        print("Too few good frames after filtering, using all frames from pass 1.")
         good_frames = frames
     elif len(good_frames) < 10:
-        print(f"UPOZORENJE: samo {len(good_frames)} frejmova ispod praga od "
-              f"{OUTLIER_RMS_THRESHOLD_MM}mm -- moze biti nedovoljno geometrijske "
-              f"raznovrsnosti za pouzdan fit (razmisli o blagom podizanju praga).")
+        print(f"WARNING: only {len(good_frames)} frames below the threshold of "
+              f"{OUTLIER_RMS_THRESHOLD_MM}mm -- may be insufficient geometric "
+              f"diversity for a reliable fit (consider slightly increasing the threshold).")
 
     normals = np.array([f[1] for f in good_frames])
     cos_angles = normals @ normals.T
     np.fill_diagonal(cos_angles, 1.0)
     min_cos = cos_angles.min()
-    print(f"\nMax ugao izmedju board normala u dobrim frejmovima: "
+    print(f"\nMaximum angle between board normals in good frames: "
           f"{np.degrees(np.arccos(np.clip(min_cos, -1, 1))):.1f} deg")
     if np.degrees(np.arccos(np.clip(min_cos, -1, 1))) < 15:
-        print("UPOZORENJE: normale su skoro paralelne -- translacija unutar "
-              "ravni table je slabo ogranicena, rezultat je nepouzdan.")
+        print("WARNING: normals are nearly parallel -- translation within the "
+              "board plane is poorly constrained, the result is unreliable.")
 
-    print(f"\n--- PROLAZ 2: Re-optimizacija na {len(good_frames)} dobrih frejmova ---")
+    print(f"\n--- PASS 2: Re-optimization on {len(good_frames)} good frames ---")
     result2 = optimize(good_frames)
 
     rvec = result2.x[:3].reshape(3, 1)
     tvec = result2.x[3:6].reshape(3, 1)
     R, _ = cv2.Rodrigues(rvec)
 
-    print("\n--- Per-frame point-to-plane RMS (posle filtriranja) ---")
+    print("\n--- Per-frame point-to-plane RMS (after filtering) ---")
     for name, rms in per_frame_rms(result2.x, good_frames):
         print(f"  {name}: RMS={rms*1000:.2f}mm")
 
     overall_rms = np.sqrt(np.mean(residuals(result2.x, good_frames) ** 2))
-    print(f"\nGlobalni RMS (ocisceni frejmovi): {overall_rms*1000:.2f}mm")
+    print(f"\nGlobal RMS (filtered frames): {overall_rms*1000:.2f}mm")
     print("Rotation (lidar->camera):\n", R)
     print("Translation (lidar->camera):\n", tvec)
 
@@ -305,7 +308,7 @@ def main():
     fs.write("rvec", rvec)
     fs.write("tvec", tvec)
     fs.release()
-    print(f"\nSacuvano u {OUTPUT_PATH}")
+    print(f"\nSaved to {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
