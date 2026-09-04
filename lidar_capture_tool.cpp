@@ -69,7 +69,7 @@ void pointCloudPutCallback(std::shared_ptr<PointCloudMsg> msg)
         accumulated_cloud.points.clear();
         accumulated_cloud.height = 1;
     }
-    // Add this frame's points to the accumulated cloud.
+    # Add this frame's points to the accumulated cloud.
     accumulated_cloud.points.insert(accumulated_cloud.points.end(),
                                      msg->points.begin(), msg->points.end());
     frames_collected++;
