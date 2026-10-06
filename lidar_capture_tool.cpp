@@ -11,7 +11,7 @@
 #include <thread>       // this_thread::sleep_for -- explicit to avoid the previous include bug
 #include <fstream>
 #include <iostream>
-#include <cstdio>       // std::remove
+#include <cstdio>       
 #include <stdexcept>
 #include <unistd.h>     // readlink
 #include <linux/limits.h> // PATH_MAX
